@@ -17,31 +17,18 @@ jobs:
         run: |
           $ErrorActionPreference = 'Stop'
 
-          # Apply all registry tweaks in a single pass
-          $regFile = "$env:TEMP\rdp.reg"
-          @'
-Windows Registry Editor Version 5.00
+          # Apply registry tweaks directly (no .reg file, no heredoc)
+          $tsKey = 'HKLM:\SYSTEM\CurrentControlSet\Control\Terminal Server'
+          $rdpKey = 'HKLM:\SYSTEM\CurrentControlSet\Control\Terminal Server\WinStations\RDP-Tcp'
+          $polKey = 'HKLM:\SOFTWARE\Microsoft\Windows\CurrentVersion\Policies\System'
+          $logKey = 'HKLM:\SOFTWARE\Microsoft\Windows NT\CurrentVersion\Winlogon'
 
-[HKEY_LOCAL_MACHINE\SYSTEM\CurrentControlSet\Control\Terminal Server]
-"fDenyTSConnections"=dword:00000000
+          Set-ItemProperty -Path $tsKey  -Name 'fDenyTSConnections' -Value 0 -Type DWord -Force
+          Set-ItemProperty -Path $rdpKey -Name 'UserAuthentication' -Value 1 -Type DWord -Force
+          Set-ItemProperty -Path $polKey -Name 'EnableFirstLogonAnimation' -Value 0 -Type DWord -Force
+          Set-ItemProperty -Path $logKey -Name 'EnableDelayedDesktopSwitchTimeout' -Value 0 -Type DWord -Force
 
-[HKEY_LOCAL_MACHINE\SYSTEM\CurrentControlSet\Control\Terminal Server\WinStations\RDP-Tcp]
-"UserAuthentication"=dword:00000001
-
-[HKEY_LOCAL_MACHINE\SOFTWARE\Microsoft\Windows\CurrentVersion\Policies\System]
-"EnableFirstLogonAnimation"=dword:00000000
-
-[HKEY_LOCAL_MACHINE\SOFTWARE\Microsoft\Windows NT\CurrentVersion\Winlogon]
-"EnableDelayedDesktopSwitchTimeout"=dword:00000000
-'@ | Set-Content -Path $regFile -Encoding ASCII
-
-          reg import $regFile | Out-Null
-          Remove-Item $regFile -Force
-
-          # Enable RDP firewall rule
           netsh advfirewall firewall set rule group="remote desktop" new enable=Yes | Out-Null
-
-          # Restart TermService
           Restart-Service -Name TermService -Force
 
       - name: Create-Admin-User
@@ -49,7 +36,6 @@ Windows Registry Editor Version 5.00
         run: |
           $ErrorActionPreference = 'Stop'
 
-          # Generate password once
           $charSet = @{
             Upper   = [char[]](65..90)
             Lower   = [char[]](97..122)
@@ -63,17 +49,16 @@ Windows Registry Editor Version 5.00
           $password = -join ($raw | Sort-Object { Get-Random })
           $securePassword = ConvertTo-SecureString $password -AsPlainText -Force
 
-          # Create user
-          New-LocalUser -Name $env:ADMIN_USER -Password $securePassword -AccountNeverExpires -PasswordNeverExpires
+          if (Get-LocalUser -Name $env:ADMIN_USER -ErrorAction SilentlyContinue) {
+            Remove-LocalUser -Name $env:ADMIN_USER
+          }
 
-          # Add to Administrators
+          New-LocalUser -Name $env:ADMIN_USER -Password $securePassword -AccountNeverExpires -PasswordNeverExpires
           Add-LocalGroupMember -Group "Administrators" -Member $env:ADMIN_USER
 
-          # Pre-create profile (LoadUserProfile speeds up first login)
           $cred = New-Object System.Management.Automation.PSCredential($env:ADMIN_USER, $securePassword)
           Start-Process "cmd.exe" -Credential $cred -ArgumentList "/c exit" -LoadUserProfile -Wait
 
-          # Export to GITHUB_ENV
           "FINAL_PASS=$password" | Out-File -FilePath $env:GITHUB_ENV -Append -Encoding utf8
 
       - name: Install-Tailscale
@@ -84,11 +69,9 @@ Windows Registry Editor Version 5.00
           $tsUrl = "https://pkgs.tailscale.com/stable/tailscale-setup-1.96.3-amd64.msi"
           $installerPath = "$env:TEMP\ts.msi"
 
-          # Download with progress disabled for speed
           $ProgressPreference = 'SilentlyContinue'
           Invoke-WebRequest -Uri $tsUrl -OutFile $installerPath -UseBasicParsing
 
-          # Silent install, suppress reboot
           $proc = Start-Process msiexec.exe `
             -ArgumentList "/i `"$installerPath`" /qn /norestart ALLUSERS=1 REBOOT=ReallySuppress" `
             -Wait -PassThru
@@ -109,7 +92,6 @@ Windows Registry Editor Version 5.00
             throw "Tailscale executable not found at $tsExe"
           }
 
-          # Wait for Tailscale service to be ready (poll instead of fixed sleep)
           $deadline = (Get-Date).AddSeconds(60)
           while ((Get-Date) -lt $deadline) {
             $status = & $tsExe status 2>&1
@@ -128,7 +110,6 @@ Windows Registry Editor Version 5.00
             throw "Tailscale up failed with exit code $LASTEXITCODE"
           }
 
-          # Get IPv4 address (retry briefly)
           $ip = $null
           for ($i = 0; $i -lt 20; $i++) {
             $ip = & $tsExe ip -4 2>$null
@@ -152,7 +133,6 @@ Windows Registry Editor Version 5.00
           Write-Host " RDP Pass : $env:FINAL_PASS"
           Write-Host "================================"
 
-          # Keep runner alive; break if stop file exists
           $stopFile = "C:\stop_rdp.txt"
           while (-not (Test-Path $stopFile)) {
             Start-Sleep -Seconds 5
